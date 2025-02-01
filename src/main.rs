@@ -3,6 +3,7 @@ use futures_util::StreamExt; // for bytes_stream and stream.next()
 use hyper::body::to_bytes;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use log::{error, info};
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -42,29 +43,29 @@ struct Chat {
 
 /// Helper: Convert the full request body to bytes.
 async fn body_to_bytes(body: Body) -> Result<Vec<u8>, hyper::Error> {
-    println!("Converting request body to bytes...");
+    info!("Converting request body to bytes...");
     let bytes = to_bytes(body).await?;
-    println!("Finished converting body ({} bytes)", bytes.len());
+    info!("Finished converting body ({} bytes)", bytes.len());
     Ok(bytes.to_vec())
 }
 
 /// HTTP handler for incoming webhook requests.
 async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     let raw_path = req.uri().path();
-    println!("Incoming request: {} {}", req.method(), raw_path);
+    info!("Incoming request: {} {}", req.method(), raw_path);
 
     // Normalize the path by trimming both leading and trailing slashes.
     let normalized_path = raw_path.trim_matches('/');
-    println!("Normalized path: {}", normalized_path);
+    info!("Normalized path: {}", normalized_path);
 
     if req.method() == Method::POST && normalized_path == "webhook" {
         let whole_body = match body_to_bytes(req.into_body()).await {
             Ok(bytes) => {
-                println!("Received body: {:?}", String::from_utf8_lossy(&bytes));
+                info!("Received body: {:?}", String::from_utf8_lossy(&bytes));
                 bytes
             }
             Err(err) => {
-                eprintln!("Error reading body: {}", err);
+                error!("Error reading body: {}", err);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Body::from("Bad Request"))
@@ -74,11 +75,11 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
 
         let update: Update = match serde_json::from_slice(&whole_body) {
             Ok(upd) => {
-                println!("Parsed update successfully.");
+                info!("Parsed update successfully.");
                 upd
             }
             Err(err) => {
-                eprintln!("Failed to parse update: {}", err);
+                error!("Failed to parse update: {}", err);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Body::from("Bad Request"))
@@ -89,25 +90,25 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
         if let Some(message) = update.message {
             if let Some(text) = message.text {
                 let chat_id = message.chat.id;
-                println!("Received message from chat {}: {}", chat_id, text);
+                info!("Received message from chat {}: {}", chat_id, text);
 
                 let openai_response = call_openai_api(text).await;
-                println!("OpenAI response: {}", openai_response);
+                info!("OpenAI response: {}", openai_response);
 
                 if let Err(e) = send_reply(chat_id, openai_response).await {
-                    eprintln!("Failed to send reply: {}", e);
+                    error!("Failed to send reply: {}", e);
                 } else {
-                    println!("Reply sent to chat {}", chat_id);
+                    info!("Reply sent to chat {}", chat_id);
                 }
             } else {
-                println!("No text found in the message.");
+                info!("No text found in the message.");
             }
         } else {
-            println!("No message found in update.");
+            info!("No message found in update.");
         }
         Ok(Response::new(Body::from("OK")))
     } else {
-        println!("Request did not match POST webhook endpoint.");
+        info!("Request did not match POST webhook endpoint.");
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not Found"))
@@ -116,10 +117,8 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
 }
 
 /// Calls the OpenAI API using the "Create thread and run" endpoint with streaming enabled.
-/// It waits for SSE events, normalizes newlines, and accumulates reply text from delta events.
-/// If the SSE event "[DONE]" is received or a timeout occurs, it returns the accumulated reply.
 async fn call_openai_api(prompt: String) -> String {
-    println!("Calling OpenAI API with prompt: {}", prompt);
+    info!("Calling OpenAI API with prompt: {}", prompt);
     let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
     let client = reqwest::Client::new();
     let assistant_id = "asst_a4UKVFs40KuWDofTyc3aqblf"; // DAPConsult's assistant ID
@@ -149,12 +148,12 @@ async fn call_openai_api(prompt: String) -> String {
         .await;
 
     if let Err(err) = resp {
-        eprintln!("Error calling OpenAI API: {}", err);
+        error!("Error calling OpenAI API: {}", err);
         return "Error calling OpenAI API".to_string();
     }
 
     let response = resp.unwrap();
-    println!("Started streaming response from OpenAI.");
+    info!("Started streaming response from OpenAI.");
 
     let mut reply = String::new();
     // Set a maximum duration for streaming (e.g. 30 seconds).
@@ -178,7 +177,7 @@ async fn call_openai_api(prompt: String) -> String {
                                 if line.starts_with("data:") {
                                     let data = line.trim_start_matches("data:").trim();
                                     if data == "[DONE]" {
-                                        println!("Stream ended with [DONE].");
+                                        info!("Stream ended with [DONE].");
                                         return;
                                     }
                                     match serde_json::from_str::<serde_json::Value>(data) {
@@ -200,7 +199,7 @@ async fn call_openai_api(prompt: String) -> String {
                                             }
                                         }
                                         Err(e) => {
-                                            println!(
+                                            info!(
                                                 "Failed to parse SSE data: {}. Data: {}",
                                                 e, data
                                             );
@@ -212,7 +211,7 @@ async fn call_openai_api(prompt: String) -> String {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading stream chunk: {}", e);
+                    error!("Error reading stream chunk: {}", e);
                     break;
                 }
             }
@@ -230,7 +229,7 @@ async fn call_openai_api(prompt: String) -> String {
 
 /// Sends the reply to the Telegram Bot API.
 async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
-    println!("Sending reply to chat {}: {}", chat_id, text);
+    info!("Sending reply to chat {}: {}", chat_id, text);
     let telegram_token =
         env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN not set in .env");
     let url = format!("https://api.telegram.org/bot{}/sendMessage", telegram_token);
@@ -240,17 +239,19 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
         "text": text,
     });
     let response = client.post(&url).json(&params).send().await?;
-    println!("Telegram API response: {:?}", response.text().await);
+    info!("Telegram API response: {:?}", response.text().await);
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting application...");
+    // Initialize the logger
+    env_logger::init();
+    info!("Starting application...");
     std::io::stdout().flush().unwrap();
 
     dotenv().ok();
-    println!("Environment loaded.");
+    info!("Environment loaded.");
     std::io::stdout().flush().unwrap();
 
     let port: u16 = env::var("PORT")
@@ -258,21 +259,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("PORT must be a valid number");
     let addr = ([0, 0, 0, 0], port).into();
-    println!("Binding server to address: http://{}", addr);
+    info!("Binding server to address: http://{}", addr);
     std::io::stdout().flush().unwrap();
 
     let make_svc = make_service_fn(|_conn| async {
-        println!("New connection established.");
+        info!("New connection established.");
         Ok::<_, Infallible>(service_fn(handle_request))
     });
     let server = Server::bind(&addr).serve(make_svc);
 
-    println!("Webhook receiver listening on http://{}", addr);
+    info!("Webhook receiver listening on http://{}", addr);
     std::io::stdout().flush().unwrap();
 
     match server.await {
-        Ok(_) => println!("Server ended gracefully."),
-        Err(e) => eprintln!("Server error: {}", e),
+        Ok(_) => info!("Server ended gracefully."),
+        Err(e) => error!("Server error: {}", e),
     }
     Ok(())
 }
