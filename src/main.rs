@@ -1,6 +1,5 @@
-// src/main.rs
-
 use dotenv::dotenv;
+use futures_util::StreamExt; // for bytes_stream and stream.next()
 use hyper::body::to_bytes;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
@@ -8,7 +7,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::env;
-use std::io::{self, Write};
+use std::io::Write;
+use tokio::time::{timeout, Duration};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -40,7 +40,7 @@ struct Chat {
     id: i64,
 }
 
-/// Helper function to collect the body into a Vec<u8>
+/// Helper: Convert the full request body to bytes.
 async fn body_to_bytes(body: Body) -> Result<Vec<u8>, hyper::Error> {
     println!("Converting request body to bytes...");
     let bytes = to_bytes(body).await?;
@@ -48,15 +48,15 @@ async fn body_to_bytes(body: Body) -> Result<Vec<u8>, hyper::Error> {
     Ok(bytes.to_vec())
 }
 
+/// HTTP handler for incoming webhook requests.
 async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     let raw_path = req.uri().path();
     println!("Incoming request: {} {}", req.method(), raw_path);
 
-    // Normalize path by trimming both leading and trailing slashes.
+    // Normalize the path by trimming both leading and trailing slashes.
     let normalized_path = raw_path.trim_matches('/');
     println!("Normalized path: {}", normalized_path);
 
-    // Only handle POST requests to the "webhook" endpoint.
     if req.method() == Method::POST && normalized_path == "webhook" {
         let whole_body = match body_to_bytes(req.into_body()).await {
             Ok(bytes) => {
@@ -91,11 +91,9 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
                 let chat_id = message.chat.id;
                 println!("Received message from chat {}: {}", chat_id, text);
 
-                // Call OpenAI API with the message text.
                 let openai_response = call_openai_api(text).await;
                 println!("OpenAI response: {}", openai_response);
 
-                // Reply to the user via Telegram.
                 if let Err(e) = send_reply(chat_id, openai_response).await {
                     eprintln!("Failed to send reply: {}", e);
                 } else {
@@ -117,13 +115,15 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     }
 }
 
+/// Calls the OpenAI API using the "Create thread and run" endpoint with streaming enabled.
+/// It waits for SSE events, normalizes newlines, and accumulates reply text from delta events.
+/// If the SSE event "[DONE]" is received or a timeout occurs, it returns the accumulated reply.
 async fn call_openai_api(prompt: String) -> String {
     println!("Calling OpenAI API with prompt: {}", prompt);
     let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
     let client = reqwest::Client::new();
     let assistant_id = "asst_a4UKVFs40KuWDofTyc3aqblf"; // DAPConsult's assistant ID
 
-    // --- Step 1: Create thread and run in one request ---
     let run_url = "https://api.openai.com/v1/threads/runs";
     let run_payload = json!({
         "assistant_id": assistant_id,
@@ -136,10 +136,11 @@ async fn call_openai_api(prompt: String) -> String {
                     "vector_store_ids": ["vs_GKxymyy9y9UG5XjbxmVkpm6I"]
                 }
             }
-        }
+        },
+        "stream": true
     });
 
-    let run_resp = client
+    let resp = client
         .post(run_url)
         .header("OpenAI-Beta", "assistants=v2")
         .bearer_auth(&openai_token)
@@ -147,77 +148,87 @@ async fn call_openai_api(prompt: String) -> String {
         .send()
         .await;
 
-    let thread_id = match run_resp {
-        Ok(resp) => {
-            let json_resp = resp.json::<serde_json::Value>().await.unwrap();
-            println!("Received run object: {:?}", json_resp);
-            // The run object contains a "thread_id" field.
-            json_resp
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        }
-        Err(err) => {
-            eprintln!("Error creating thread run: {}", err);
-            return "Error creating thread run".to_string();
-        }
-    };
-
-    if thread_id.is_empty() {
-        return "Failed to create thread run".to_string();
+    if let Err(err) = resp {
+        eprintln!("Error calling OpenAI API: {}", err);
+        return "Error calling OpenAI API".to_string();
     }
 
-    // --- Step 2: List messages in the thread to get the assistant's reply ---
-    let messages_url = format!("https://api.openai.com/v1/threads/{}/messages", thread_id);
-    let messages_resp = client
-        .get(&messages_url)
-        .header("OpenAI-Beta", "assistants=v2")
-        .bearer_auth(&openai_token)
-        .send()
-        .await;
+    let response = resp.unwrap();
+    println!("Started streaming response from OpenAI.");
 
-    match messages_resp {
-        Ok(resp) => {
-            let json_resp = resp.json::<serde_json::Value>().await.unwrap();
-            println!("Received messages list: {:?}", json_resp);
-            // The response should have a "data" field containing an array of messages.
-            if let Some(data) = json_resp.get("data").and_then(|v| v.as_array()) {
-                // Look for the first message where role is "assistant".
-                if let Some(assistant_msg) = data
-                    .iter()
-                    .find(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
-                {
-                    // The message's content is an array of parts.
-                    if let Some(content_arr) =
-                        assistant_msg.get("content").and_then(|v| v.as_array())
-                    {
-                        // Join all text parts.
-                        let reply: String = content_arr
-                            .iter()
-                            .filter_map(|part| {
-                                part.get("text")
-                                    .and_then(|t| t.get("value"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            })
-                            .collect::<Vec<String>>()
-                            .join(" ");
-                        if !reply.is_empty() {
-                            return reply;
+    let mut reply = String::new();
+    // Set a maximum duration for streaming (e.g. 30 seconds).
+    let stream_timeout = Duration::from_secs(30);
+    let stream_future = async {
+        let mut response_stream = response.bytes_stream();
+        while let Some(item) = response_stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    if let Ok(mut chunk_str) = std::str::from_utf8(&chunk).map(|s| s.to_string()) {
+                        // Normalize newlines to "\n"
+                        chunk_str = chunk_str.replace("\r\n", "\n");
+                        // Split by double newline to separate SSE events.
+                        for event_block in chunk_str.split("\n\n") {
+                            let event_block = event_block.trim();
+                            if event_block.is_empty() {
+                                continue;
+                            }
+                            // Process each line.
+                            for line in event_block.lines() {
+                                if line.starts_with("data:") {
+                                    let data = line.trim_start_matches("data:").trim();
+                                    if data == "[DONE]" {
+                                        println!("Stream ended with [DONE].");
+                                        return;
+                                    }
+                                    match serde_json::from_str::<serde_json::Value>(data) {
+                                        Ok(delta_json) => {
+                                            if let Some(delta) = delta_json.get("delta") {
+                                                if let Some(content_arr) =
+                                                    delta.get("content").and_then(|v| v.as_array())
+                                                {
+                                                    for part in content_arr {
+                                                        if let Some(text_val) = part
+                                                            .get("text")
+                                                            .and_then(|t| t.get("value"))
+                                                            .and_then(|s| s.as_str())
+                                                        {
+                                                            reply.push_str(text_val);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!(
+                                                "Failed to parse SSE data: {}. Data: {}",
+                                                e, data
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+                Err(e) => {
+                    eprintln!("Error reading stream chunk: {}", e);
+                    break;
+                }
             }
-            "No response".to_string()
         }
-        Err(err) => {
-            eprintln!("Error listing messages: {}", err);
-            "Error listing messages".to_string()
-        }
+    };
+
+    // Wait for the stream to finish or time out.
+    let _ = timeout(stream_timeout, stream_future).await;
+    if reply.is_empty() {
+        "No response".to_string()
+    } else {
+        reply
     }
 }
 
+/// Sends the reply to the Telegram Bot API.
 async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
     println!("Sending reply to chat {}: {}", chat_id, text);
     let telegram_token =
@@ -236,32 +247,29 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting application...");
-    io::stdout().flush().unwrap();
+    std::io::stdout().flush().unwrap();
 
     dotenv().ok();
     println!("Environment loaded.");
-    io::stdout().flush().unwrap();
+    std::io::stdout().flush().unwrap();
 
-    // Read the port from .env (or default to 8080 if not set)
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse()
         .expect("PORT must be a valid number");
     let addr = ([0, 0, 0, 0], port).into();
     println!("Binding server to address: http://{}", addr);
-    io::stdout().flush().unwrap();
+    std::io::stdout().flush().unwrap();
 
     let make_svc = make_service_fn(|_conn| async {
         println!("New connection established.");
-        // For each connection, we create a service to handle requests.
         Ok::<_, Infallible>(service_fn(handle_request))
     });
     let server = Server::bind(&addr).serve(make_svc);
 
     println!("Webhook receiver listening on http://{}", addr);
-    io::stdout().flush().unwrap();
+    std::io::stdout().flush().unwrap();
 
-    // Await the server future.
     match server.await {
         Ok(_) => println!("Server ended gracefully."),
         Err(e) => eprintln!("Server error: {}", e),
