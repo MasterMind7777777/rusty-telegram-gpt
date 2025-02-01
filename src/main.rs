@@ -111,7 +111,8 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     }
 }
 
-/// Calls the OpenAI API with streaming enabled and sends Telegram messages as text deltas arrive.
+/// Calls the OpenAI API with streaming enabled and sends Telegram messages
+/// only when a sentence-ending punctuation (".", "!", "?") is found or at end of stream.
 async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     info!("Calling OpenAI API with prompt: {}", prompt);
     let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
@@ -151,7 +152,9 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     let response = resp.unwrap();
     info!("Started streaming response from OpenAI.");
 
-    // Set a maximum duration for streaming.
+    // A buffer to accumulate text until a sentence is complete.
+    let mut sentence_buffer = String::new();
+    // Set a maximum duration for streaming (e.g. 30 seconds).
     let stream_timeout = Duration::from_secs(30);
     let stream_future = async {
         let mut response_stream = response.bytes_stream();
@@ -167,6 +170,7 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
                             if event_block.is_empty() {
                                 continue;
                             }
+                            // Process each line in the SSE event.
                             for line in event_block.lines() {
                                 if line.starts_with("data:") {
                                     let data = line.trim_start_matches("data:").trim();
@@ -186,15 +190,38 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
                                                             .and_then(|t| t.get("value"))
                                                             .and_then(|s| s.as_str())
                                                         {
-                                                            info!("Sending chunk: {}", text_val);
-                                                            // Send the chunk as soon as it arrives.
-                                                            if let Err(e) = send_reply(
-                                                                chat_id,
-                                                                text_val.to_string(),
-                                                            )
-                                                            .await
+                                                            // Append received text to the buffer.
+                                                            sentence_buffer.push_str(text_val);
+                                                            info!(
+                                                                "Buffer updated: {}",
+                                                                sentence_buffer
+                                                            );
+                                                            // Check if the buffer has any sentence-ending punctuation.
+                                                            while let Some(pos) = sentence_buffer
+                                                                .find(|c: char| {
+                                                                    c == '.' || c == '!' || c == '?'
+                                                                })
                                                             {
-                                                                error!("Failed to send Telegram message: {}", e);
+                                                                // Drain from the start up to and including the punctuation.
+                                                                let sentence: String =
+                                                                    sentence_buffer
+                                                                        .drain(..=pos)
+                                                                        .collect();
+                                                                let sentence = sentence.trim();
+                                                                if !sentence.is_empty() {
+                                                                    info!(
+                                                                        "Sending sentence: {}",
+                                                                        sentence
+                                                                    );
+                                                                    if let Err(e) = send_reply(
+                                                                        chat_id,
+                                                                        sentence.to_string(),
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        error!("Failed to send Telegram message: {}", e);
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -222,6 +249,14 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     };
 
     let _ = timeout(stream_timeout, stream_future).await;
+    // At the end of the stream, send any remaining text.
+    if !sentence_buffer.trim().is_empty() {
+        let remaining = sentence_buffer.trim().to_string();
+        info!("Sending remaining text: {}", remaining);
+        if let Err(e) = send_reply(chat_id, remaining).await {
+            error!("Failed to send Telegram message: {}", e);
+        }
+    }
 }
 
 /// Sends the reply to the Telegram Bot API.
