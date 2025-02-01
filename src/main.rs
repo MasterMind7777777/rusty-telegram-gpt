@@ -91,15 +91,10 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
             if let Some(text) = message.text {
                 let chat_id = message.chat.id;
                 info!("Received message from chat {}: {}", chat_id, text);
-
-                let openai_response = call_openai_api(text).await;
-                info!("OpenAI response: {}", openai_response);
-
-                if let Err(e) = send_reply(chat_id, openai_response).await {
-                    error!("Failed to send reply: {}", e);
-                } else {
-                    info!("Reply sent to chat {}", chat_id);
-                }
+                // Spawn a task that streams and sends Telegram messages as data arrives.
+                tokio::spawn(async move {
+                    call_openai_api_and_send(chat_id, text).await;
+                });
             } else {
                 info!("No text found in the message.");
             }
@@ -116,8 +111,8 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     }
 }
 
-/// Calls the OpenAI API using the "Create thread and run" endpoint with streaming enabled.
-async fn call_openai_api(prompt: String) -> String {
+/// Calls the OpenAI API with streaming enabled and sends Telegram messages as text deltas arrive.
+async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     info!("Calling OpenAI API with prompt: {}", prompt);
     let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
     let client = reqwest::Client::new();
@@ -149,14 +144,14 @@ async fn call_openai_api(prompt: String) -> String {
 
     if let Err(err) = resp {
         error!("Error calling OpenAI API: {}", err);
-        return "Error calling OpenAI API".to_string();
+        let _ = send_reply(chat_id, "Error calling OpenAI API".to_string()).await;
+        return;
     }
 
     let response = resp.unwrap();
     info!("Started streaming response from OpenAI.");
 
-    let mut reply = String::new();
-    // Set a maximum duration for streaming (e.g. 30 seconds).
+    // Set a maximum duration for streaming.
     let stream_timeout = Duration::from_secs(30);
     let stream_future = async {
         let mut response_stream = response.bytes_stream();
@@ -164,7 +159,7 @@ async fn call_openai_api(prompt: String) -> String {
             match item {
                 Ok(chunk) => {
                     if let Ok(mut chunk_str) = std::str::from_utf8(&chunk).map(|s| s.to_string()) {
-                        // Normalize newlines to "\n"
+                        // Normalize newlines.
                         chunk_str = chunk_str.replace("\r\n", "\n");
                         // Split by double newline to separate SSE events.
                         for event_block in chunk_str.split("\n\n") {
@@ -172,7 +167,6 @@ async fn call_openai_api(prompt: String) -> String {
                             if event_block.is_empty() {
                                 continue;
                             }
-                            // Process each line.
                             for line in event_block.lines() {
                                 if line.starts_with("data:") {
                                     let data = line.trim_start_matches("data:").trim();
@@ -192,7 +186,16 @@ async fn call_openai_api(prompt: String) -> String {
                                                             .and_then(|t| t.get("value"))
                                                             .and_then(|s| s.as_str())
                                                         {
-                                                            reply.push_str(text_val);
+                                                            info!("Sending chunk: {}", text_val);
+                                                            // Send the chunk as soon as it arrives.
+                                                            if let Err(e) = send_reply(
+                                                                chat_id,
+                                                                text_val.to_string(),
+                                                            )
+                                                            .await
+                                                            {
+                                                                error!("Failed to send Telegram message: {}", e);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -218,13 +221,7 @@ async fn call_openai_api(prompt: String) -> String {
         }
     };
 
-    // Wait for the stream to finish or time out.
     let _ = timeout(stream_timeout, stream_future).await;
-    if reply.is_empty() {
-        "No response".to_string()
-    } else {
-        reply
-    }
 }
 
 /// Sends the reply to the Telegram Bot API.
@@ -245,8 +242,7 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize the logger
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Starting application...");
     std::io::stdout().flush().unwrap();
 
