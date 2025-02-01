@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::env;
+use std::io::{self, Write};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -164,8 +165,10 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting application...");
+    io::stdout().flush().unwrap();
     dotenv().ok();
     println!("Environment loaded.");
+    io::stdout().flush().unwrap();
 
     // Read the port from .env (or default to 8080 if not set)
     let port: u16 = env::var("PORT")
