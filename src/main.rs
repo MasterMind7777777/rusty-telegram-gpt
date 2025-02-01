@@ -3,8 +3,7 @@
 use dotenv::dotenv;
 use hyper::body::to_bytes;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::Body;
-use hyper::{Method, Request, Response, Server, StatusCode};
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -50,9 +49,15 @@ async fn body_to_bytes(body: Body) -> Result<Vec<u8>, hyper::Error> {
 }
 
 async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    println!("Incoming request: {} {}", req.method(), req.uri().path());
-    // Only handle POST requests to "/webhook"
-    if req.method() == Method::POST && req.uri().path() == "/webhook" {
+    let raw_path = req.uri().path();
+    println!("Incoming request: {} {}", req.method(), raw_path);
+
+    // Normalize path by trimming both leading and trailing slashes.
+    let normalized_path = raw_path.trim_matches('/');
+    println!("Normalized path: {}", normalized_path);
+
+    // Only handle POST requests to the "webhook" endpoint.
+    if req.method() == Method::POST && normalized_path == "webhook" {
         let whole_body = match body_to_bytes(req.into_body()).await {
             Ok(bytes) => {
                 println!("Received body: {:?}", String::from_utf8_lossy(&bytes));
@@ -89,6 +94,7 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
                 // Call OpenAI API with the message text.
                 let openai_response = call_openai_api(text).await;
                 println!("OpenAI response: {}", openai_response);
+
                 // Reply to the user via Telegram.
                 if let Err(e) = send_reply(chat_id, openai_response).await {
                     eprintln!("Failed to send reply: {}", e);
@@ -103,7 +109,7 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
         }
         Ok(Response::new(Body::from("OK")))
     } else {
-        println!("Request did not match /webhook endpoint.");
+        println!("Request did not match POST webhook endpoint.");
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not Found"))
@@ -115,34 +121,99 @@ async fn call_openai_api(prompt: String) -> String {
     println!("Calling OpenAI API with prompt: {}", prompt);
     let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
     let client = reqwest::Client::new();
-    let url = "https://api.openai.com/v1/assistants";
-    let params = json!({
-        "prompt": prompt,
+    let assistant_id = "asst_a4UKVFs40KuWDofTyc3aqblf"; // DAPConsult's assistant ID
+
+    // --- Step 1: Create thread and run in one request ---
+    let run_url = "https://api.openai.com/v1/threads/runs";
+    let run_payload = json!({
+        "assistant_id": assistant_id,
+        "thread": {
+            "messages": [
+                { "role": "user", "content": prompt }
+            ],
+            "tool_resources": {
+                "file_search": {
+                    "vector_store_ids": ["vs_GKxymyy9y9UG5XjbxmVkpm6I"]
+                }
+            }
+        }
     });
 
-    match client
-        .post(url)
-        .bearer_auth(openai_token)
-        .json(&params)
+    let run_resp = client
+        .post(run_url)
+        .header("OpenAI-Beta", "assistants=v2")
+        .bearer_auth(&openai_token)
+        .json(&run_payload)
         .send()
-        .await
-    {
-        Ok(response) => match response.json::<serde_json::Value>().await {
-            Ok(json_resp) => {
-                println!("Received JSON from OpenAI: {:?}", json_resp);
-                json_resp["response"]
-                    .as_str()
-                    .unwrap_or("No response")
-                    .to_string()
-            }
-            Err(err) => {
-                eprintln!("Error parsing OpenAI response: {}", err);
-                "Error parsing response".to_string()
-            }
-        },
+        .await;
+
+    let thread_id = match run_resp {
+        Ok(resp) => {
+            let json_resp = resp.json::<serde_json::Value>().await.unwrap();
+            println!("Received run object: {:?}", json_resp);
+            // The run object contains a "thread_id" field.
+            json_resp
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        }
         Err(err) => {
-            eprintln!("Error calling OpenAI API: {}", err);
-            "Error calling OpenAI API".to_string()
+            eprintln!("Error creating thread run: {}", err);
+            return "Error creating thread run".to_string();
+        }
+    };
+
+    if thread_id.is_empty() {
+        return "Failed to create thread run".to_string();
+    }
+
+    // --- Step 2: List messages in the thread to get the assistant's reply ---
+    let messages_url = format!("https://api.openai.com/v1/threads/{}/messages", thread_id);
+    let messages_resp = client
+        .get(&messages_url)
+        .header("OpenAI-Beta", "assistants=v2")
+        .bearer_auth(&openai_token)
+        .send()
+        .await;
+
+    match messages_resp {
+        Ok(resp) => {
+            let json_resp = resp.json::<serde_json::Value>().await.unwrap();
+            println!("Received messages list: {:?}", json_resp);
+            // The response should have a "data" field containing an array of messages.
+            if let Some(data) = json_resp.get("data").and_then(|v| v.as_array()) {
+                // Look for the first message where role is "assistant".
+                if let Some(assistant_msg) = data
+                    .iter()
+                    .find(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+                {
+                    // The message's content is an array of parts.
+                    if let Some(content_arr) =
+                        assistant_msg.get("content").and_then(|v| v.as_array())
+                    {
+                        // Join all text parts.
+                        let reply: String = content_arr
+                            .iter()
+                            .filter_map(|part| {
+                                part.get("text")
+                                    .and_then(|t| t.get("value"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect::<Vec<String>>()
+                            .join(" ");
+                        if !reply.is_empty() {
+                            return reply;
+                        }
+                    }
+                }
+            }
+            "No response".to_string()
+        }
+        Err(err) => {
+            eprintln!("Error listing messages: {}", err);
+            "Error listing messages".to_string()
         }
     }
 }
@@ -157,7 +228,7 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
         "chat_id": chat_id,
         "text": text,
     });
-    let response = client.post(url).json(&params).send().await?;
+    let response = client.post(&url).json(&params).send().await?;
     println!("Telegram API response: {:?}", response.text().await);
     Ok(())
 }
@@ -166,6 +237,7 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting application...");
     io::stdout().flush().unwrap();
+
     dotenv().ok();
     println!("Environment loaded.");
     io::stdout().flush().unwrap();
@@ -177,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("PORT must be a valid number");
     let addr = ([0, 0, 0, 0], port).into();
     println!("Binding server to address: http://{}", addr);
+    io::stdout().flush().unwrap();
 
     let make_svc = make_service_fn(|_conn| async {
         println!("New connection established.");
@@ -186,6 +259,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server::bind(&addr).serve(make_svc);
 
     println!("Webhook receiver listening on http://{}", addr);
+    io::stdout().flush().unwrap();
+
     // Await the server future.
     match server.await {
         Ok(_) => println!("Server ended gracefully."),
