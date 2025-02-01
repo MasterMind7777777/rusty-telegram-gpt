@@ -1,0 +1,5 @@
+# Ignore build artifacts
+/target/
+
+# Ignore local environment variables (don’t commit secrets)
+.env
