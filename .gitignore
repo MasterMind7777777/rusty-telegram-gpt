@@ -3,3 +3,5 @@
 
 # Ignore local environment variables (don’t commit secrets)
 .env
+
+bot.log
