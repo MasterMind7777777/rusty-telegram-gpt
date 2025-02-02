@@ -1,19 +1,19 @@
 {
-  "created_at": 1735391374,
+  "created_at": 1709940660,
   "expires_after": null,
   "expires_at": null,
   "file_counts": {
     "cancelled": 0,
-    "completed": 20,
+    "completed": 14,
     "failed": 0,
     "in_progress": 0,
-    "total": 20
+    "total": 14
   },
-  "id": "vs_GKxymyy9y9UG5XjbxmVkpm6I",
-  "last_active_at": 1738505204,
+  "id": "vs_pk7Qny1jtoOD6qJQwPeZRGhQ",
+  "last_active_at": 1738504109,
   "metadata": {},
-  "name": "Vector store for DAPConsult",
+  "name": null,
   "object": "vector_store",
   "status": "completed",
-  "usage_bytes": 4593492
+  "usage_bytes": 135090
 }

@@ -1,0 +1,100 @@
+[
+  {
+    "id": "file-GVFcALDeW4DCZHP3WxpAEU",
+    "object": "file",
+    "created_at": 1738417269,
+    "filename": "Toko plus SCU.pdf",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-8WK1WJPaEQAjQhyzrjvnZv",
+    "object": "file",
+    "created_at": 1738415821,
+    "filename": "Toko Plus.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-82xFkL3v4CXNG2LmDMVDNy",
+    "object": "file",
+    "created_at": 1737278042,
+    "filename": "Tiefen_colors.pdf",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-7xqbpcJ4FbPcWU6RbmaHNW",
+    "object": "file",
+    "created_at": 1735460015,
+    "filename": "velvetreiniger.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-X4zfLrQcPtNzRE9hnJfn8F",
+    "object": "file",
+    "created_at": 1735459578,
+    "filename": "kras_shop.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-Gb6Xb2WAuxHGc13GWZmfbg",
+    "object": "file",
+    "created_at": 1735459434,
+    "filename": "ros_shop.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-Jc4SnPFHuaJahbkZozPaAa",
+    "object": "file",
+    "created_at": 1735458194,
+    "filename": "mos_shop.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-6LGT2qwBeKYbjDXpsDoom8",
+    "object": "file",
+    "created_at": 1735457971,
+    "filename": "velvetreiniger.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-EQtTA5VZZZP44sZvoMsCq8",
+    "object": "file",
+    "created_at": 1735457384,
+    "filename": "tifen.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-CZ8HuLsHpPx9GG97XxxCpL",
+    "object": "file",
+    "created_at": 1735389767,
+    "filename": "Vlotho_SALZREINGER.txt",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-Pm7F8qt0jfBR9KoIq6nmfc6L",
+    "object": "file",
+    "created_at": 1704722747,
+    "filename": "Y2mate_mx_Урок_1_Материаловедение_Что_такое_кожа_и_топология_шкуры.json",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-kDiUdnuWiBybwFNFpL4DXMwy",
+    "object": "file",
+    "created_at": 1704722753,
+    "filename": "Y2mate_mx_Урок_3_Материаловедение_Разновидности_кож,_часть_вторая.json",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-7DE4di2QtbWevB9D59g8WKX9",
+    "object": "file",
+    "created_at": 1704297001,
+    "filename": "chto-takoe-kozha-crazy-horse.json",
+    "purpose": "assistants"
+  },
+  {
+    "id": "file-aQDNNxkMvJIJoggkvJNqXf6V",
+    "object": "file",
+    "created_at": 1704722747,
+    "filename": "Y2mate_mx_Урок_2_Материаловедение_Разновидности_кож,_часть_первая.json",
+    "purpose": "assistants"
+  }
+]
