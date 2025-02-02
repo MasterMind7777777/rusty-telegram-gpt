@@ -111,8 +111,81 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     }
 }
 
+/// Processes a single SSE data line.
+/// Returns true if a termination signal ("[DONE]") is encountered.
+async fn process_line(line: &str, sentence_buffer: &mut String, chat_id: i64) -> bool {
+    if !line.starts_with("data:") {
+        return false;
+    }
+
+    let data = line.trim_start_matches("data:").trim();
+    if data == "[DONE]" {
+        info!("Stream ended with [DONE].");
+        return true;
+    }
+
+    let delta_json = match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(json) => json,
+        Err(e) => {
+            info!("Failed to parse SSE data: {}. Data: {}", e, data);
+            return false;
+        }
+    };
+
+    let delta = match delta_json.get("delta") {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let content_arr = match delta.get("content").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    for part in content_arr {
+        if let Some(text_val) = part
+            .get("text")
+            .and_then(|t| t.get("value"))
+            .and_then(|s| s.as_str())
+        {
+            // Append received text to the buffer.
+            sentence_buffer.push_str(text_val);
+            info!("Buffer updated: {}", sentence_buffer);
+
+            // Check for double newlines and send complete sentences.
+            while let Some(pos) = sentence_buffer.find("\n\n") {
+                let sentence: String = sentence_buffer.drain(..pos + 2).collect();
+                let sentence = sentence.trim();
+                if !sentence.is_empty() {
+                    info!("Sending sentence: {}", sentence);
+                    if let Err(e) = send_reply(chat_id, sentence.to_string()).await {
+                        error!("Failed to send Telegram message: {}", e);
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Processes an entire SSE event block (split by double newlines).
+/// Returns true if a termination signal is encountered.
+async fn process_event_block(
+    event_block: &str,
+    sentence_buffer: &mut String,
+    chat_id: i64,
+) -> bool {
+    // Process each line in the event block.
+    for line in event_block.lines() {
+        if process_line(line, sentence_buffer, chat_id).await {
+            return true;
+        }
+    }
+    false
+}
+
 /// Calls the OpenAI API with streaming enabled and sends Telegram messages
-/// only when a sentence-ending punctuation (".", "!", "?") is found or at end of stream.
+/// whenever a double newline delimiter is found in the accumulated text.
 async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     info!("Calling OpenAI API with prompt: {}", prompt);
     let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
@@ -132,6 +205,7 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
                 }
             }
         },
+        "tool_choice": { "type": "file_search" },
         "stream": true
     });
 
@@ -152,90 +226,29 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     let response = resp.unwrap();
     info!("Started streaming response from OpenAI.");
 
-    // A buffer to accumulate text until a sentence is complete.
+    // A buffer to accumulate text until a double newline is encountered.
     let mut sentence_buffer = String::new();
     // Set a maximum duration for streaming (e.g. 30 seconds).
     let stream_timeout = Duration::from_secs(30);
+
     let stream_future = async {
         let mut response_stream = response.bytes_stream();
         while let Some(item) = response_stream.next().await {
             match item {
                 Ok(chunk) => {
-                    if let Ok(mut chunk_str) = std::str::from_utf8(&chunk).map(|s| s.to_string()) {
+                    if let Ok(chunk_str) = std::str::from_utf8(&chunk).map(|s| s.to_string()) {
                         // Normalize newlines.
-                        chunk_str = chunk_str.replace("\r\n", "\n");
+                        let normalized_chunk = chunk_str.replace("\r\n", "\n");
                         // Split by double newline to separate SSE events.
-                        for event_block in chunk_str.split("\n\n") {
+                        for event_block in normalized_chunk.split("\n\n") {
                             let event_block = event_block.trim();
                             if event_block.is_empty() {
                                 continue;
                             }
-                            // Process each line in the SSE event.
-                            for line in event_block.lines() {
-                                if line.starts_with("data:") {
-                                    let data = line.trim_start_matches("data:").trim();
-                                    if data == "[DONE]" {
-                                        info!("Stream ended with [DONE].");
-                                        return;
-                                    }
-                                    match serde_json::from_str::<serde_json::Value>(data) {
-                                        Ok(delta_json) => {
-                                            if let Some(delta) = delta_json.get("delta") {
-                                                if let Some(content_arr) =
-                                                    delta.get("content").and_then(|v| v.as_array())
-                                                {
-                                                    for part in content_arr {
-                                                        if let Some(text_val) = part
-                                                            .get("text")
-                                                            .and_then(|t| t.get("value"))
-                                                            .and_then(|s| s.as_str())
-                                                        {
-                                                            // Append received text to the buffer.
-                                                            sentence_buffer.push_str(text_val);
-                                                            info!(
-                                                                "Buffer updated: {}",
-                                                                sentence_buffer
-                                                            );
-                                                            // Check if the buffer has any sentence-ending punctuation.
-                                                            while let Some(pos) = sentence_buffer
-                                                                .find(|c: char| {
-                                                                    c == '.' || c == '!' || c == '?'
-                                                                })
-                                                            {
-                                                                // Drain from the start up to and including the punctuation.
-                                                                let sentence: String =
-                                                                    sentence_buffer
-                                                                        .drain(..=pos)
-                                                                        .collect();
-                                                                let sentence = sentence.trim();
-                                                                if !sentence.is_empty() {
-                                                                    info!(
-                                                                        "Sending sentence: {}",
-                                                                        sentence
-                                                                    );
-                                                                    if let Err(e) = send_reply(
-                                                                        chat_id,
-                                                                        sentence.to_string(),
-                                                                    )
-                                                                    .await
-                                                                    {
-                                                                        error!("Failed to send Telegram message: {}", e);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            info!(
-                                                "Failed to parse SSE data: {}. Data: {}",
-                                                e, data
-                                            );
-                                        }
-                                    }
-                                }
+                            // Process this event block.
+                            if process_event_block(event_block, &mut sentence_buffer, chat_id).await
+                            {
+                                return;
                             }
                         }
                     }
@@ -249,6 +262,7 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
     };
 
     let _ = timeout(stream_timeout, stream_future).await;
+
     // At the end of the stream, send any remaining text.
     if !sentence_buffer.trim().is_empty() {
         let remaining = sentence_buffer.trim().to_string();
@@ -277,11 +291,12 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     info!("Starting application...");
     std::io::stdout().flush().unwrap();
 
-    dotenv().ok();
     info!("Environment loaded.");
     std::io::stdout().flush().unwrap();
 
