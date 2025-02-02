@@ -4,41 +4,63 @@ use hyper::body::to_bytes;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use log::{error, info};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::env;
+use std::fs::read_to_string;
 use std::io::Write;
+use std::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct Update {
-    update_id: i64,
-    message: Option<Message>,
+// ---------------- Global File Mapping ----------------
+// This global will store a vector of friendly filenames in the order
+// corresponding to the file details returned by OpenAI.
+// We assume that the citation marker's first number is 1-indexed into this vector.
+static FILE_NAMES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+// Helper function to load file names from a JSON file.
+// We expect the file details JSON to be located at "{DATA_DIR}/{store_id}_files_details.json".
+fn load_file_names(store_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // Get the data directory from environment (or default to "./data")
+    let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let path = format!("{}/{}_files_details.json", data_dir, store_id);
+    let contents = read_to_string(&path)?;
+    // Parse as JSON array of objects.
+    let file_details: Vec<serde_json::Value> = serde_json::from_str(&contents)?;
+    // Extract the "filename" field from each file.
+    let names = file_details
+        .iter()
+        .filter_map(|v| {
+            v.get("filename")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    Ok(names)
 }
 
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct Message {
-    message_id: i64,
-    from: Option<User>,
-    chat: Chat,
-    date: i64,
-    text: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct User {
-    id: i64,
-    first_name: String,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct Chat {
-    id: i64,
+// Helper function to replace citation markers in the text using the global FILE_NAMES vector.
+// It looks for markers of the form "【(\d+):(\d+)†source】" and replaces the first number
+// (assumed to be 1-indexed) with the corresponding friendly filename.
+fn replace_citations(text: &str) -> String {
+    // Regex to capture markers like "【4:3†source】"
+    let re = Regex::new(r"【(\d+):(\d+)†source】").unwrap();
+    // Lock the global FILE_NAMES vector.
+    let file_names = FILE_NAMES.lock().unwrap();
+    re.replace_all(text, |caps: &regex::Captures| {
+        if let Ok(idx) = caps[1].parse::<usize>() {
+            // Convert 1-indexed to 0-indexed.
+            if idx > 0 && idx <= file_names.len() {
+                return format!("【{}†source】", file_names[idx - 1]);
+            }
+        }
+        // Fallback: return the original marker if parsing fails or index is out of range.
+        caps[0].to_string()
+    })
+    .into_owned()
 }
 
 /// Helper: Convert the full request body to bytes.
@@ -157,8 +179,10 @@ async fn process_line(line: &str, sentence_buffer: &mut String, chat_id: i64) ->
                 let sentence: String = sentence_buffer.drain(..pos + 2).collect();
                 let sentence = sentence.trim();
                 if !sentence.is_empty() {
-                    info!("Sending sentence: {}", sentence);
-                    if let Err(e) = send_reply(chat_id, sentence.to_string()).await {
+                    // Replace citation markers with friendly file names.
+                    let processed_sentence = replace_citations(sentence);
+                    info!("Sending sentence: {}", processed_sentence);
+                    if let Err(e) = send_reply(chat_id, processed_sentence).await {
                         error!("Failed to send Telegram message: {}", e);
                     }
                 }
@@ -300,9 +324,53 @@ async fn send_reply(chat_id: i64, text: String) -> Result<(), reqwest::Error> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Update {
+    update_id: i64,
+    message: Option<Message>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Message {
+    message_id: i64,
+    from: Option<User>,
+    chat: Chat,
+    date: i64,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct User {
+    id: i64,
+    first_name: String,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Chat {
+    id: i64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
+    // Initialize file mapping from a JSON file.
+    // Assume the vector store ID is fixed for your bot (used in the run_payload)
+    let store_id = "vs_GKxymyy9y9UG5XjbxmVkpm6I";
+    match load_file_names(store_id) {
+        Ok(names) => {
+            let mut mapping = FILE_NAMES.lock().unwrap();
+            *mapping = names;
+            info!("Loaded {} file names.", mapping.len());
+        }
+        Err(e) => {
+            error!("Failed to load file names: {}", e);
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     info!("Starting application...");
