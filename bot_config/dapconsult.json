@@ -1,0 +1,7 @@
+{
+  "bot_name": "dapconsult",
+  "telegram_bot_token": "7566445553:AAE5G8qArSOgNU-z6PlHi3IalAMYeETXPRM",
+  "telegram_secret_token": "random-very-discreet-token",
+  "openai_assistant_id": "asst_a4UKVFs40KuWDofTyc3aqblf",
+  "vector_store_id": "vs_GKxymyy9y9UG5XjbxmVkpm6I"
+}
