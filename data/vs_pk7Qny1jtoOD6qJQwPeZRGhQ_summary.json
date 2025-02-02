@@ -10,9 +10,9 @@
     "total": 14
   },
   "id": "vs_pk7Qny1jtoOD6qJQwPeZRGhQ",
-  "last_active_at": 1738504109,
+  "last_active_at": 1738506326,
   "metadata": {},
-  "name": null,
+  "name": "Vlotho_storage",
   "object": "vector_store",
   "status": "completed",
   "usage_bytes": 135090
