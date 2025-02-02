@@ -1,0 +1,7 @@
+{
+  "bot_name": "vlotho",
+  "telegram_bot_token": "1764772755:AAFkx7M9N8OGCYoBEZt6V3-T_wquf_Ac9ls",
+  "telegram_secret_token": "random-very-discreet-token-even-more-hard",
+  "openai_assistant_id": "asst_LQfy7LCoHFB537ukeVAg4r6Z",
+  "vector_store_id": "vs_pk7Qny1jtoOD6qJQwPeZRGhQ"
+}
