@@ -236,20 +236,28 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
         while let Some(item) = response_stream.next().await {
             match item {
                 Ok(chunk) => {
-                    if let Ok(chunk_str) = std::str::from_utf8(&chunk).map(|s| s.to_string()) {
-                        // Normalize newlines.
-                        let normalized_chunk = chunk_str.replace("\r\n", "\n");
-                        // Split by double newline to separate SSE events.
-                        for event_block in normalized_chunk.split("\n\n") {
-                            let event_block = event_block.trim();
-                            if event_block.is_empty() {
-                                continue;
-                            }
-                            // Process this event block.
-                            if process_event_block(event_block, &mut sentence_buffer, chat_id).await
-                            {
-                                return;
-                            }
+                    info!("Received a new chunk from the stream.");
+                    let chunk_str = match std::str::from_utf8(&chunk) {
+                        Ok(s) => s.to_string(),
+                        Err(e) => {
+                            error!("Failed to decode chunk: {}", e);
+                            continue;
+                        }
+                    };
+                    info!("Chunk content: {}", chunk_str);
+                    // Normalize newlines.
+                    let normalized_chunk = chunk_str.replace("\r\n", "\n");
+                    // Split by double newline to separate SSE events.
+                    for event_block in normalized_chunk.split("\n\n") {
+                        let event_block = event_block.trim();
+                        if event_block.is_empty() {
+                            continue;
+                        }
+                        info!("Processing event block: {}", event_block);
+                        // Process this event block.
+                        if process_event_block(event_block, &mut sentence_buffer, chat_id).await {
+                            info!("Termination signal encountered during event block processing.");
+                            return;
                         }
                     }
                 }
