@@ -205,6 +205,9 @@ async fn call_openai_api_and_send(chat_id: i64, prompt: String) {
                 }
             }
         },
+        "tools": [
+            { "type": "file_search" }
+        ],
         "tool_choice": { "type": "file_search" },
         "stream": true
     });
