@@ -1,3 +1,4 @@
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use hyper::body::to_bytes;
@@ -22,6 +23,40 @@ static BOT_CONFIGS: Lazy<Mutex<HashMap<String, BotConfig>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static FILE_MAPPINGS: Lazy<Mutex<HashMap<String, Vec<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+// ---------------- Sled-Based User Context ----------------
+
+#[derive(Serialize, Deserialize, Debug)]
+struct UserContext {
+    thread_id: String,
+    last_inquiry: DateTime<Utc>,
+}
+
+static USER_CONTEXT_DB: Lazy<sled::Db> =
+    Lazy::new(|| sled::open("user_context_db").expect("Failed to open sled database"));
+
+fn store_user_context(
+    user_id: i64,
+    context: &UserContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let key = user_id.to_string();
+    let value = serde_json::to_vec(context)?;
+    USER_CONTEXT_DB.insert(key, value)?;
+    USER_CONTEXT_DB.flush()?;
+    Ok(())
+}
+
+fn get_user_context(
+    user_id: i64,
+) -> Result<Option<UserContext>, Box<dyn std::error::Error + Send + Sync>> {
+    let key = user_id.to_string();
+    if let Some(value) = USER_CONTEXT_DB.get(key)? {
+        let context: UserContext = serde_json::from_slice(&value)?;
+        Ok(Some(context))
+    } else {
+        Ok(None)
+    }
+}
 
 // ---------------- Bot Configuration Types ----------------
 
@@ -49,7 +84,7 @@ fn load_bot_configs() -> Result<HashMap<String, BotConfig>, Box<dyn std::error::
     Ok(configs)
 }
 
-// Loads the friendly file names for a given vector store ID from "{DATA_DIR}/{vector_store_id}_files_details.json".
+// Loads the friendly file names for a given vector store ID.
 fn load_file_names(vector_store_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let data_dir = env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let path = format!("{}/{}_files_details.json", data_dir, vector_store_id);
@@ -68,8 +103,6 @@ fn load_file_names(vector_store_id: &str) -> Result<Vec<String>, Box<dyn std::er
 
 // ---------------- Citation Replacement ----------------
 
-/// Replaces citation markers of the form "【(\d+):(\d+)†source】" in the given text
-/// with friendly file names using the mapping for the given bot.
 fn replace_citations(text: &str, bot_name: &str) -> String {
     let re = Regex::new(r"【(\d+):(\d+)†source】").unwrap();
     let file_mapping = FILE_MAPPINGS.lock().unwrap();
@@ -89,7 +122,6 @@ fn replace_citations(text: &str, bot_name: &str) -> String {
 
 // ---------------- HTTP Helper ----------------
 
-/// Reads the full request body into bytes.
 async fn body_to_bytes(body: Body) -> Result<Vec<u8>, hyper::Error> {
     info!("Converting request body to bytes...");
     let bytes = to_bytes(body).await?;
@@ -127,7 +159,6 @@ struct Chat {
 
 // ---------------- HTTP Handler ----------------
 
-/// Expects the URL path to be in the format "/{bot_name}/webhook".
 async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     let raw_path = req.uri().path().to_owned();
     info!("Incoming request: {} {}", req.method(), raw_path);
@@ -142,7 +173,6 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     let bot_name = segments[0];
     info!("Bot name from URL: {}", bot_name);
 
-    // Clone the bot configuration so no MutexGuard is held across awaits.
     let bot_config = {
         let bot_configs = BOT_CONFIGS.lock().unwrap();
         bot_configs.get(bot_name).cloned()
@@ -174,7 +204,6 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
 
     let update: Update = match serde_json::from_slice::<Update>(&whole_body) {
         Ok(upd) => {
-            // Now we can log the fields (thus "using" them).
             info!("Parsed update with update_id: {}", upd.update_id);
             if let Some(ref msg) = upd.message {
                 info!(
@@ -199,12 +228,37 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     if let Some(message) = update.message {
         if let Some(text) = message.text {
             let chat_id = message.chat.id;
+
+            // Check and remove an expired user context (if any)
+            if let Some(uid) = message.from.as_ref().map(|u| u.id) {
+                match get_user_context(uid) {
+                    Ok(Some(context)) => {
+                        let now = Utc::now();
+                        if now.signed_duration_since(context.last_inquiry)
+                            > ChronoDuration::minutes(10)
+                        {
+                            info!(
+                                "Context for user {} is older than 10 minutes. Resetting.",
+                                uid
+                            );
+                            let _ = USER_CONTEXT_DB.remove(uid.to_string());
+                        } else {
+                            info!("Existing context for user {}: {:?}", uid, context);
+                        }
+                    }
+                    Ok(None) => info!("No existing context for user {}", uid),
+                    Err(e) => error!("Error retrieving user context: {}", e),
+                }
+            }
+
             info!("Received message from chat {}: {}", chat_id, text);
-            // Clone bot_config and bot_name for the spawned task.
             let bot_config_clone = bot_config.clone();
             let bot_name_owned = bot_name.to_owned();
+            // Pass the optional user_id (if available) to the spawned task.
+            let user_id = message.from.as_ref().map(|u| u.id);
             tokio::spawn(async move {
-                call_openai_api_and_send(chat_id, text, &bot_config_clone, &bot_name_owned).await;
+                call_openai_api_and_send(chat_id, text, user_id, &bot_config_clone, bot_name_owned)
+                    .await;
             });
         } else {
             info!("No text found in the message.");
@@ -215,9 +269,219 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     Ok(Response::new(Body::from("OK")))
 }
 
+// ---------------- New Helper Functions for Endpoints ----------------
+
+/// Creates a new thread using the Create Thread endpoint.
+async fn create_thread(
+    client: &reqwest::Client,
+    token: &str,
+    prompt: &str,
+    bot_config: &BotConfig,
+) -> Result<String, reqwest::Error> {
+    let url = "https://api.openai.com/v1/threads";
+    let payload = json!({
+        "messages": [
+            { "role": "user", "content": prompt }
+        ],
+        "tool_resources": {
+            "file_search": {
+                "vector_store_ids": [ bot_config.vector_store_id ]
+            }
+        }
+    });
+    let resp = client
+        .post(url)
+        .header("OpenAI-Beta", "assistants=v2")
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    let resp_json: serde_json::Value = resp.json().await?;
+    // Expect the thread object to include an "id" field.
+    let thread_id = resp_json["id"].as_str().unwrap_or_default().to_string();
+    Ok(thread_id)
+}
+
+/// Creates a new message in an existing thread.
+async fn create_message(
+    client: &reqwest::Client,
+    token: &str,
+    thread_id: &str,
+    prompt: &str,
+) -> Result<(), reqwest::Error> {
+    let url = format!("https://api.openai.com/v1/threads/{}/messages", thread_id);
+    let payload = json!({
+        "role": "user",
+        "content": prompt,
+    });
+    client
+        .post(&url)
+        .header("OpenAI-Beta", "assistants=v2")
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Creates a run (with streaming enabled) for the given thread.
+async fn create_run(
+    client: &reqwest::Client,
+    token: &str,
+    thread_id: &str,
+    bot_config: &BotConfig,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let url = format!("https://api.openai.com/v1/threads/{}/runs", thread_id);
+    let payload = json!({
+        "assistant_id": bot_config.openai_assistant_id,
+        "stream": true,
+        // You can include other optional parameters here.
+    });
+    let resp = client
+        .post(&url)
+        .header("OpenAI-Beta", "assistants=v2")
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    Ok(resp)
+}
+
+// ---------------- Updated OpenAI API Call ----------------
+
+/// Depending on whether there’s a stored thread (and it’s less than 10 minutes old),
+/// either create a new thread or use the existing one.
+/// Then, post a new message (if using an existing thread) and create a run.
+async fn call_openai_api_and_send(
+    chat_id: i64,
+    prompt: String,
+    user_id: Option<i64>,
+    bot_config: &BotConfig,
+    bot_name: String,
+) {
+    info!("Calling OpenAI API with prompt: {}", prompt);
+    let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
+    let client = reqwest::Client::new();
+    let thread_id: String;
+
+    // If we have a user_id, try to use the stored context.
+    if let Some(uid) = user_id {
+        if let Ok(Some(context)) = get_user_context(uid) {
+            thread_id = context.thread_id;
+            // Post a new message to the existing thread.
+            if let Err(e) = create_message(&client, &openai_token, &thread_id, &prompt).await {
+                error!("Error creating message in thread {}: {}", thread_id, e);
+                let _ = send_reply(chat_id, "Error creating message".to_string(), &bot_name).await;
+                return;
+            }
+        } else {
+            // No valid stored thread—create a new one.
+            match create_thread(&client, &openai_token, &prompt, bot_config).await {
+                Ok(tid) => thread_id = tid,
+                Err(e) => {
+                    error!("Error creating thread: {}", e);
+                    let _ =
+                        send_reply(chat_id, "Error creating thread".to_string(), &bot_name).await;
+                    return;
+                }
+            }
+        }
+    } else {
+        // No user_id provided; create a new thread.
+        match create_thread(&client, &openai_token, &prompt, bot_config).await {
+            Ok(tid) => thread_id = tid,
+            Err(e) => {
+                error!("Error creating thread: {}", e);
+                let _ = send_reply(chat_id, "Error creating thread".to_string(), &bot_name).await;
+                return;
+            }
+        }
+    }
+
+    // Now create a run for the thread.
+    let run_resp = match create_run(&client, &openai_token, &thread_id, bot_config).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("Error creating run: {}", e);
+            let _ = send_reply(chat_id, "Error creating run".to_string(), &bot_name).await;
+            return;
+        }
+    };
+
+    info!(
+        "Started streaming response from OpenAI on thread {}.",
+        thread_id
+    );
+    let mut sentence_buffer = String::new();
+    let stream_timeout = Duration::from_secs(30);
+    let stream_future = async {
+        let mut response_stream = run_resp.bytes_stream();
+        while let Some(item) = response_stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    info!("Received a new chunk from the stream.");
+                    let chunk_str = match std::str::from_utf8(&chunk) {
+                        Ok(s) => s.to_string(),
+                        Err(e) => {
+                            error!("Failed to decode chunk: {}", e);
+                            continue;
+                        }
+                    };
+                    info!("Chunk content: {}", chunk_str);
+                    let normalized_chunk = chunk_str.replace("\r\n", "\n");
+                    for event_block in normalized_chunk.split("\n\n") {
+                        let event_block = event_block.trim();
+                        if event_block.is_empty() {
+                            continue;
+                        }
+                        info!("Processing event block: {}", event_block);
+                        if process_event_block(
+                            event_block,
+                            &mut sentence_buffer,
+                            chat_id,
+                            &bot_name,
+                        )
+                        .await
+                        {
+                            info!("Termination signal encountered during event block processing.");
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading stream chunk: {}", e);
+                    break;
+                }
+            }
+        }
+    };
+    let _ = timeout(stream_timeout, stream_future).await;
+    if !sentence_buffer.trim().is_empty() {
+        let remaining = sentence_buffer.trim().to_string();
+        info!("Sending remaining text: {}", remaining);
+        if let Err(e) = send_reply(chat_id, remaining, &bot_name).await {
+            error!("Failed to send Telegram message: {}", e);
+        }
+    }
+
+    // Update stored context with the (new or reused) thread ID.
+    if let Some(uid) = user_id {
+        let new_context = UserContext {
+            thread_id: thread_id.clone(),
+            last_inquiry: Utc::now(),
+        };
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || store_user_context(uid, &new_context)).await
+        {
+            error!("Failed to update user context for user {}: {:?}", uid, e);
+        } else {
+            info!("User context updated for user {}", uid);
+        }
+    }
+}
+
 // ---------------- SSE Processing ----------------
 
-/// Processes a single SSE data line and, after replacing citation markers, sends the sentence.
 async fn process_line(
     line: &str,
     sentence_buffer: &mut String,
@@ -271,7 +535,6 @@ async fn process_line(
     false
 }
 
-/// Processes an entire SSE event block.
 async fn process_event_block(
     event_block: &str,
     sentence_buffer: &mut String,
@@ -286,102 +549,8 @@ async fn process_event_block(
     false
 }
 
-// ---------------- OpenAI API Call ----------------
-
-/// Calls the OpenAI API with streaming enabled, using the bot's configuration.
-async fn call_openai_api_and_send(
-    chat_id: i64,
-    prompt: String,
-    bot_config: &BotConfig,
-    bot_name: &str,
-) {
-    info!("Calling OpenAI API with prompt: {}", prompt);
-    let openai_token = env::var("OPENAI_TOKEN").expect("OPENAI_TOKEN not set in .env");
-    let client = reqwest::Client::new();
-    let run_url = "https://api.openai.com/v1/threads/runs";
-    let run_payload = json!({
-        "assistant_id": bot_config.openai_assistant_id,
-        "thread": {
-            "messages": [
-                { "role": "user", "content": prompt }
-            ],
-            "tool_resources": {
-                "file_search": {
-                    "vector_store_ids": [ bot_config.vector_store_id ]
-                }
-            }
-        },
-        "tools": [
-            { "type": "file_search" }
-        ],
-        "tool_choice": { "type": "file_search" },
-        "stream": true
-    });
-    let resp = client
-        .post(run_url)
-        .header("OpenAI-Beta", "assistants=v2")
-        .bearer_auth(&openai_token)
-        .json(&run_payload)
-        .send()
-        .await;
-    if let Err(err) = resp {
-        error!("Error calling OpenAI API: {}", err);
-        let _ = send_reply(chat_id, "Error calling OpenAI API".to_string(), bot_name).await;
-        return;
-    }
-    let response = resp.unwrap();
-    info!("Started streaming response from OpenAI.");
-    let mut sentence_buffer = String::new();
-    let stream_timeout = Duration::from_secs(30);
-    let stream_future = async {
-        let mut response_stream = response.bytes_stream();
-        while let Some(item) = response_stream.next().await {
-            match item {
-                Ok(chunk) => {
-                    info!("Received a new chunk from the stream.");
-                    let chunk_str = match std::str::from_utf8(&chunk) {
-                        Ok(s) => s.to_string(),
-                        Err(e) => {
-                            error!("Failed to decode chunk: {}", e);
-                            continue;
-                        }
-                    };
-                    info!("Chunk content: {}", chunk_str);
-                    let normalized_chunk = chunk_str.replace("\r\n", "\n");
-                    for event_block in normalized_chunk.split("\n\n") {
-                        let event_block = event_block.trim();
-                        if event_block.is_empty() {
-                            continue;
-                        }
-                        info!("Processing event block: {}", event_block);
-                        if process_event_block(event_block, &mut sentence_buffer, chat_id, bot_name)
-                            .await
-                        {
-                            info!("Termination signal encountered during event block processing.");
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error reading stream chunk: {}", e);
-                    break;
-                }
-            }
-        }
-    };
-    let _ = timeout(stream_timeout, stream_future).await;
-    if !sentence_buffer.trim().is_empty() {
-        let remaining = sentence_buffer.trim().to_string();
-        info!("Sending remaining text: {}", remaining);
-        if let Err(e) = send_reply(chat_id, remaining, bot_name).await {
-            error!("Failed to send Telegram message: {}", e);
-        }
-    }
-}
-
 // ---------------- Telegram Reply ----------------
 
-/// Sends a reply using the Telegram Bot API, using the bot's token.
 async fn send_reply(chat_id: i64, text: String, bot_name: &str) -> Result<(), reqwest::Error> {
     info!("Sending reply to chat {}: {}", chat_id, text);
     let bot_config = {
@@ -413,7 +582,6 @@ async fn send_reply(chat_id: i64, text: String, bot_name: &str) -> Result<(), re
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    // Load bot configurations.
     let configs = load_bot_configs()?;
     {
         let mut bot_configs = BOT_CONFIGS.lock().unwrap();
@@ -424,7 +592,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BOT_CONFIGS.lock().unwrap().len()
     );
 
-    // For each bot, load its file names mapping.
     {
         let bot_configs = BOT_CONFIGS.lock().unwrap();
         for config in bot_configs.values() {

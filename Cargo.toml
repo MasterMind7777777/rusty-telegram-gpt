@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 dotenv = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+sled = "0.34"
 futures-util = "0.3"
 hyper = { version = "0.14", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
